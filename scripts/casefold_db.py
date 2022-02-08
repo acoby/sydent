@@ -73,10 +73,12 @@ class CantSendEmailException(Exception):
     pass
 
 
-def calculate_lookup_hash(sydent, address):
-    cur = sydent.db.cursor()
-    pepper_result = cur.execute("SELECT lookup_pepper from hashing_metadata")
-    pepper = pepper_result.fetchone()[0]
+def calculate_lookup_hash(sydent: Sydent, address: str) -> str:
+    pepper = sydent.threepidBinder.hashing_store.get_lookup_pepper()
+    if pepper is None:
+        raise RuntimeError(
+            "No lookup pepper found; Sydent should have generated one on startup."
+        )
     combo = "%s %s %s" % (address, "email", pepper)
     lookup_hash = sha256_and_url_safe_base64(combo)
     return lookup_hash
@@ -217,14 +219,11 @@ def update_local_associations(
 
         try:
             # Delete each association, and send an email mentioning the affected MXID.
-            if delta.to_delete is not None:
+            if delta.to_delete is not None and not dry_run:
                 for to_delete in delta.to_delete:
-                    if send_email and not dry_run:
+                    if send_email and to_delete.mxid != delta.to_update.mxid:
                         # If the MXID is one that will still be associated with this
                         # email address after this run, don't send an email for it.
-                        if to_delete.mxid == delta.to_update.mxid:
-                            continue
-
                         sendEmailWithBackoff(
                             sydent,
                             to_delete.address,
@@ -232,16 +231,27 @@ def update_local_associations(
                             test=test,
                         )
 
-                    if not dry_run:
-                        cur = db.cursor()
-                        cur.execute(
-                            "DELETE FROM local_threepid_associations WHERE medium = 'email' AND address = ?",
-                            (to_delete.address,),
-                        )
-                        db.commit()
+                    logger.debug(
+                        "Deleting %s from table local_threepid_associations",
+                        to_delete.address,
+                    )
+                    cur = db.cursor()
+                    cur.execute(
+                        "DELETE FROM local_threepid_associations WHERE medium = 'email' AND address = ?",
+                        (to_delete.address,),
+                    )
+                    db.commit()
 
             # Update the row now that there's no duplicate.
             if not dry_run:
+                logger.debug(
+                    "Updating table local threepid associations setting address to %s, "
+                    "lookup_hash to %s, where medium = email and address = %s and mxid = %s",
+                    casefolded_address,
+                    delta.to_update.lookup_hash,
+                    delta.to_update.address,
+                    delta.to_update.mxid,
+                )
                 cur = db.cursor()
                 cur.execute(
                     "UPDATE local_threepid_associations SET address = ?, lookup_hash = ? WHERE medium = 'email' AND address = ? AND mxid = ?",
@@ -261,6 +271,7 @@ def update_local_associations(
             # to avoid deleting rows we can't warn users about, and we don't want to
             # proceed with the subsequent update because there might still be duplicates
             # in the database (since we haven't deleted everything we wanted to delete).
+            logger.warn("Failed to send email to %s; skipping!", to_delete.address)
             continue
 
 
